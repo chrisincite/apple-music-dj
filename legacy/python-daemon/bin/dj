@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""dj — Apple Music DJ 的命令列遙控器。"""
+import json, subprocess, sys, time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "daemon"))
+STATE_DIR = ROOT / "state"
+STATE = STATE_DIR / "state.json"
+FEEDBACK = STATE_DIR / "feedback.jsonl"
+NOWPLAYING = STATE_DIR / "nowplaying.json"
+PLIST = Path.home() / "Library/LaunchAgents/com.example.djd.plist"
+LABEL = "com.example.djd"
+
+
+def read(p, default):
+    try:
+        return json.loads(p.read_text())
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def write_state(**kw):
+    s = read(STATE, {})
+    s.update(kw)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    STATE.write_text(json.dumps(s, ensure_ascii=False, indent=2))
+
+
+def feedback(action, **kw):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    rec = {"action": action, "at": time.time(), **kw}
+    with FEEDBACK.open("a") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def running():
+    r = subprocess.run(["launchctl", "list", LABEL], capture_output=True, text=True)
+    return r.returncode == 0
+
+
+def usage():
+    print("""用法：
+  dj on "<vibe>"    設定氛圍並開始（例：dj on "深夜寫程式"）
+  dj vibe "<vibe>"  換氛圍，立刻重排佇列
+  dj off            停止 DJ（不關 daemon）
+  dj now            現在播什麼＋接下來的佇列
+  dj history        剛剛播過的歌
+  dj up / down / keep / skip
+  dj start / stop / restart / log     daemon 管理
+  dj panel          開啟浮動小窗""")
+
+
+def main():
+    if len(sys.argv) < 2:
+        return usage()
+    cmd = sys.argv[1]
+    arg = sys.argv[2] if len(sys.argv) > 2 else None
+
+    if cmd in ("on", "vibe"):
+        if not arg:
+            return usage()
+        feedback("vibe", vibe=arg)
+        write_state(enabled=True, vibe=arg)
+        if not running():
+            subprocess.run(["launchctl", "load", "-w", str(PLIST)])
+        print(f"🎧 vibe = {arg}（daemon 會在下個心跳內重排佇列）")
+    elif cmd == "off":
+        write_state(enabled=False)
+        print("⏹ DJ 已停手（音樂繼續播完目前佇列）")
+    elif cmd == "now":
+        d = read(NOWPLAYING, {})
+        t = d.get("track")
+        if not t:
+            print("（沒有在播）")
+        else:
+            pos, dur = int(t["position"]), int(t["duration"])
+            print(f"♪ {t['name']} — {t['artist']}")
+            print(f"  《{t['album']}》 {pos//60}:{pos%60:02d} / {dur//60}:{dur%60:02d}  [{t['state']}]")
+        print(f"🎚 vibe：{d.get('vibe') or '（未設定）'}   DJ：{'開' if d.get('enabled') else '關'}")
+        q = d.get("queue", [])
+        if q:
+            print(f"⏭ 接下來 {len(q)} 首：")
+            for i, x in enumerate(q, 1):
+                print(f"   {i:2d}. {x.get('name','?')} — {x.get('artist','')}")
+    elif cmd in ("history", "past", "recent"):
+        d = read(NOWPLAYING, {})
+        rec = d.get("recent", [])
+        if not rec:
+            print("（還沒有播過的記錄）")
+        else:
+            now_ts = time.time()
+            print("⏮ 剛剛播過：")
+            for i, x in enumerate(rec, 1):
+                mins = int((now_ts - x.get("at", now_ts)) // 60)
+                ago = "剛剛" if mins < 1 else (f"{mins} 分鐘前" if mins < 60
+                                              else f"{mins // 60} 小時前")
+                print(f"   {i:2d}. {x.get('name','?')} — {x.get('artist','')}  ({ago})")
+    elif cmd in ("up", "down", "keep", "skip"):
+        d = read(NOWPLAYING, {})
+        t = d.get("track") or {}
+        feedback(cmd, id=t.get("id", ""), name=t.get("name", ""),
+                 artist=t.get("artist", ""), album=t.get("album", ""))
+        print({"up": "👍 更多這種", "down": "👎 封鎖並跳過",
+               "keep": "＋ 存入精選", "skip": "⏭ 跳過"}[cmd] + f"：{t.get('name','')}")
+    elif cmd == "start":
+        subprocess.run(["launchctl", "load", "-w", str(PLIST)])
+        print("daemon 已啟動")
+    elif cmd == "stop":
+        subprocess.run(["launchctl", "unload", "-w", str(PLIST)])
+        print("daemon 已停止")
+    elif cmd == "restart":
+        subprocess.run(["launchctl", "unload", "-w", str(PLIST)])
+        time.sleep(1)
+        subprocess.run(["launchctl", "load", "-w", str(PLIST)])
+        print("daemon 已重啟")
+    elif cmd == "log":
+        subprocess.run(["tail", "-n", "40", str(STATE_DIR / "djd.log")])
+    elif cmd == "panel":
+        subprocess.run(["open", str(Path.home() / "Applications/Apple Music DJ.app")])
+    else:
+        usage()
+
+
+if __name__ == "__main__":
+    main()

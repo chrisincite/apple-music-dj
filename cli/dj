@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""dj — Apple Music DJ 的命令列遙控器。
+
+App 本身就是引擎；這支只是往同一個狀態目錄讀寫，讓你在終端機裡遙控它。
+App 沒開的話，指令會被記下來，等 app 下次啟動時消化。
+"""
+import json
+import sys
+import time
+from pathlib import Path
+
+STATE_DIR = Path.home() / "Library/Application Support/apple-music-dj/state"
+NOWPLAYING = STATE_DIR / "nowplaying.json"
+FEEDBACK = STATE_DIR / "feedback.jsonl"
+APP = "/Applications/Apple Music DJ.app"
+APP_USER = Path.home() / "Applications/Apple Music DJ.app"
+
+
+def read(path, default):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def send(action, **kw):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    rec = {"action": action, "at": time.time(), **kw}
+    with FEEDBACK.open("a") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def fmt_ago(ts, now):
+    m = int((now - ts) // 60)
+    if m < 1:
+        return "剛剛"
+    return f"{m} 分鐘前" if m < 60 else f"{m // 60} 小時前"
+
+
+USAGE = """用法：
+  dj on "<vibe>"    設定氛圍並開始（例：dj on "深夜寫程式"）
+  dj vibe "<vibe>"  換氛圍，保留正在播的那首、重排後續佇列
+  dj now            現在播什麼＋接下來 10 首
+  dj history        剛剛播過的歌
+  dj up             👍 之後多排這種
+  dj down           👎 封鎖這首並少排這類（同時跳過）
+  dj keep           ＋ 存進「🎧 DJ 精選」
+  dj skip           ⏭ 跳過
+  dj panel          開啟／叫回浮動小窗"""
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(USAGE)
+        return
+    cmd = sys.argv[1]
+    arg = sys.argv[2] if len(sys.argv) > 2 else None
+
+    if cmd in ("on", "vibe"):
+        if not arg:
+            print(USAGE)
+            return
+        send("vibe", vibe=arg)
+        print(f"🎧 vibe = {arg}")
+        if cmd == "on":
+            main_panel()
+    elif cmd == "now":
+        d = read(NOWPLAYING, {})
+        t = d.get("track")
+        if not t:
+            print("（沒有在播）")
+        else:
+            pos, dur = int(t.get("position", 0)), int(t.get("duration", 0))
+            print(f"♪ {t['name']} — {t['artist']}")
+            print(f"  《{t['album']}》 {pos // 60}:{pos % 60:02d}"
+                  f" / {dur // 60}:{dur % 60:02d}  [{t['state']}]")
+        print(f"🎚 vibe：{d.get('vibe') or '（未設定）'}   "
+              f"DJ：{'開' if d.get('enabled') else '關'}")
+        q = d.get("queue", [])
+        if q:
+            print(f"⏭ 接下來 {len(q)} 首：")
+            for i, x in enumerate(q, 1):
+                print(f"   {i:2d}. {x.get('name', '?')} — {x.get('artist', '')}")
+    elif cmd in ("history", "past", "recent"):
+        rec = read(NOWPLAYING, {}).get("recent", [])
+        if not rec:
+            print("（還沒有播過的記錄）")
+            return
+        now = time.time()
+        print("⏮ 剛剛播過：")
+        for i, x in enumerate(rec, 1):
+            print(f"   {i:2d}. {x.get('name', '?')} — {x.get('artist', '')}"
+                  f"  ({fmt_ago(x.get('at', now), now)})")
+    elif cmd in ("up", "down", "keep", "skip"):
+        t = read(NOWPLAYING, {}).get("track") or {}
+        send(cmd, id=t.get("id", ""), name=t.get("name", ""),
+             artist=t.get("artist", ""), album=t.get("album", ""))
+        label = {"up": "👍 更多這種", "down": "👎 封鎖並跳過",
+                 "keep": "＋ 存入精選", "skip": "⏭ 跳過"}[cmd]
+        print(f"{label}：{t.get('name', '')}")
+    elif cmd == "panel":
+        main_panel()
+    else:
+        print(USAGE)
+
+
+def main_panel():
+    import subprocess
+    target = APP if Path(APP).exists() else str(APP_USER)
+    subprocess.run(["open", target])
+
+
+if __name__ == "__main__":
+    main()
