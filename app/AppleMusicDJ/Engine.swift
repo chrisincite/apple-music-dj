@@ -42,8 +42,11 @@ final class Engine: ObservableObject {
     @Published private(set) var recent: [RecentItem] = []
     @Published private(set) var artwork: NSImage?
     @Published private(set) var busy = false
-    @Published var vibe = "" { didSet { if vibe != oldValue { persist() } } }
-    @Published var enabled = false { didSet { if enabled != oldValue { persist() } } }
+    // loading 期間要抑制 persist：否則 vibe 的 didSet 會在 enabled 還沒載入時
+    // 就把 enabled:false 寫回檔案，害每次啟動 DJ 都被關掉。
+    private var loading = false
+    @Published var vibe = "" { didSet { if !loading, vibe != oldValue { persist() } } }
+    @Published var enabled = false { didSet { if !loading, enabled != oldValue { persist() } } }
 
     private var st = PersistedState()
     private var library: [LibTrack] = []
@@ -79,6 +82,8 @@ final class Engine: ObservableObject {
     // MARK: 狀態存取
 
     private func load() {
+        loading = true
+        defer { loading = false }
         if let d = try? Data(contentsOf: stateURL),
            let s = try? JSONDecoder().decode(PersistedState.self, from: d) {
             st = s
