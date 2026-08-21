@@ -1,11 +1,17 @@
 # Apple Music DJ
 
+<img src="docs/icon.png" width="104" align="right" alt="Apple Music DJ 圖示">
+
 一支常駐在螢幕角落的小 app，依你打的一句「氛圍」持續幫 Apple Music 排歌。
 說一句「深夜寫程式，安靜不要有人聲」，它就自己維持一份 12 首的佇列，播到剩不到 8 首自動補，
 你按 👍👎 它會學。
 
 > A tiny macOS menu-less app that DJs your Apple Music library from a plain-language vibe.
 > Rule-based selection, no API keys, no LLM calls, no network.
+
+<p align="center">
+  <img src="docs/panel.png" width="420" alt="展開的小窗：正在播的歌與進度、👍👎＋⏭ 四顆按鈕、目前氛圍、換氛圍的輸入框，下面是接下來的佇列">
+</p>
 
 靈感來自 [Nick Baumann 用 Codex DJ Spotify 的做法](https://x.com/nickbaumann_/status/2090551906657517876)。
 差別在於 Spotify 有佇列 API 可用，Apple Music 沒有——所以這裡走的是 AppleScript 原生路線，
