@@ -30,7 +30,7 @@ struct FeedbackButton: View {
         Button(action: action) {
             Image(systemName: symbol)
                 .font(.system(size: 15, weight: .medium))
-                .frame(width: 46, height: 30)
+                .frame(width: 41, height: 30)
                 .background(RoundedRectangle(cornerRadius: 9)
                     .fill(Color.primary.opacity(hover ? 0.16 : 0.08)))
         }
@@ -67,6 +67,11 @@ struct PanelView: View {
             }
         }
         .animation(.easeOut(duration: 0.18), value: ui.flash)
+        .onChange(of: e.exploreNote) { note in
+            guard let note else { return }
+            ui.showFlash(note)
+            e.clearExploreNote()
+        }
         .clipShape(RoundedRectangle(cornerRadius: 15))
         .overlay(RoundedRectangle(cornerRadius: 15).strokeBorder(Color.primary.opacity(0.12)))
     }
@@ -94,24 +99,47 @@ struct PanelView: View {
     }
 
     private var controls: some View {
-        HStack(spacing: 7) {
-            FeedbackButton(symbol: "hand.thumbsup", help: "更多這種") {
-                e.thumbsUp(); ui.showFlash("👍 之後多排這種"); returnFocus()
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 5) {
+                FeedbackButton(symbol: e.isPlaying ? "pause.fill" : "play.fill",
+                               help: e.isPlaying ? "暫停" : "播放（沒在播就開始 DJ）") {
+                    let wasPlaying = e.isPlaying
+                    e.playPause()
+                    ui.showFlash(wasPlaying ? "⏸ 已暫停" : "▶︎ 開始播放")
+                    returnFocus()
+                }
+                FeedbackButton(symbol: "stop.fill", help: "停止播放並關掉 DJ") {
+                    e.stopAll(); ui.showFlash("⏹ 已停止，DJ 關閉"); returnFocus()
+                }
+                FeedbackButton(symbol: "forward.end.fill", help: "跳過") {
+                    e.skip(); ui.showFlash("⏭ 跳過"); returnFocus()
+                }
+                // 用 Rectangle 不用 Divider：Divider 在 HStack 裡的固有寬度會把
+                // 視窗撐過 330，FirstMouseHostingView 再照 fittingSize 放大就跑出螢幕
+                Rectangle().fill(Color.primary.opacity(0.18))
+                    .frame(width: 1, height: 18)
+                FeedbackButton(symbol: "hand.thumbsup", help: "更多這種") {
+                    e.thumbsUp(); ui.showFlash("👍 之後多排這種"); returnFocus()
+                }
+                FeedbackButton(symbol: "hand.thumbsdown", help: "不要這首，並少排這類") {
+                    e.thumbsDown(); ui.showFlash("👎 已封鎖並跳過"); returnFocus()
+                }
+                FeedbackButton(symbol: "plus", help: "存進「🎧 DJ 精選」") {
+                    e.keep(); ui.showFlash("＋ 已存入精選"); returnFocus()
+                }
             }
-            FeedbackButton(symbol: "hand.thumbsdown", help: "不要這首，並少排這類") {
-                e.thumbsDown(); ui.showFlash("👎 已封鎖並跳過"); returnFocus()
+            HStack(spacing: 5) {
+                Circle().fill(e.enabled ? Color.green : Color.secondary.opacity(0.4))
+                    .frame(width: 6, height: 6)
+                Text(e.vibe.isEmpty ? "未設定氛圍" : e.vibe)
+                    .font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
+                Spacer(minLength: 4)
+                if e.exploring {
+                    Text("✨ 探索中…").font(.system(size: 9)).foregroundStyle(.tertiary)
+                } else if e.exploreEnabled {
+                    Text("✨ 探索開").font(.system(size: 9)).foregroundStyle(.tertiary)
+                }
             }
-            FeedbackButton(symbol: "plus", help: "存進「🎧 DJ 精選」") {
-                e.keep(); ui.showFlash("＋ 已存入精選"); returnFocus()
-            }
-            FeedbackButton(symbol: "forward.end", help: "跳過") {
-                e.skip(); ui.showFlash("⏭ 跳過"); returnFocus()
-            }
-            Spacer()
-            Circle().fill(e.enabled ? Color.green : Color.secondary.opacity(0.4))
-                .frame(width: 6, height: 6)
-            Text(e.vibe.isEmpty ? "未設定氛圍" : e.vibe)
-                .font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
         }
         .padding(.horizontal, 13).padding(.bottom, ui.expanded ? 10 : 12)
     }
@@ -163,6 +191,25 @@ struct PanelView: View {
             .padding(.horizontal, 9).padding(.vertical, 6)
             .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.07)))
 
+            HStack(spacing: 6) {
+                Toggle("探索新曲目", isOn: $e.exploreEnabled)
+                    .toggleStyle(.checkbox).font(.system(size: 11))
+                    .help("定期從 Apple Music 目錄找一首資料庫裡沒有的歌，加進資料庫後排進佇列")
+                Toggle("含排行榜", isOn: $e.exploreWide)
+                    .toggleStyle(.checkbox).font(.system(size: 11))
+                    .disabled(!e.exploreEnabled)
+                    .help("除了延伸你已經在聽的藝人，也撈曲風排行榜（會冒出沒聽過的藝人，命中率較低）")
+                Spacer(minLength: 4)
+                Button {
+                    e.exploreNow(); ui.showFlash("✨ 開始探索…"); returnFocus()
+                } label: {
+                    Image(systemName: "sparkles").font(.system(size: 11))
+                }
+                .buttonStyle(.plain)
+                .disabled(e.exploring || e.vibe.isEmpty)
+                .help("立刻探索一次")
+            }
+
             Picker("", selection: $ui.tab) {
                 Text("接下來").tag(0)
                 Text("剛剛播過").tag(1)
@@ -174,7 +221,8 @@ struct PanelView: View {
                     if ui.tab == 0 {
                         if e.queue.isEmpty { emptyNote("佇列還空著") }
                         ForEach(Array(e.queue.enumerated()), id: \.offset) { i, q in
-                            row(index: "\(i + 1)", name: q.name, artist: q.artist, trailing: nil)
+                            row(index: q.explored ? "✨" : "\(i + 1)",
+                                name: q.name, artist: q.artist, trailing: nil)
                         }
                     } else {
                         if e.recent.isEmpty { emptyNote("還沒有播過的記錄") }

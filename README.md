@@ -4,7 +4,8 @@
 
 一支常駐在螢幕角落的小 app，依你打的一句「氛圍」持續幫 Apple Music 排歌。
 說一句「深夜寫程式，安靜不要有人聲」，它就自己維持一份 12 首的佇列，播到剩不到 8 首自動補，
-你按 👍👎 它會學。
+你按 👍👎 它會學。開著「探索新曲目」的話，它還會定期去 Apple Music 目錄挖一首你資料庫裡
+沒有的歌，加進資料庫再排進佇列。
 
 > A tiny macOS menu-less app that DJs your Apple Music library from a plain-language vibe.
 > Rule-based selection, no API keys, no LLM calls, no network.
@@ -26,11 +27,16 @@
 
 啟動後會問「Apple Music DJ 想要控制『音樂』」，必須允許。
 
+要用〈探索新曲目〉的話還要多給一個權限：**系統設定 → 隱私權與安全性 → 輔助使用 →
+打開「Apple Music DJ」**。第一次探索會自動跳出這個請求；沒給的話探索會自己關掉，
+並在小窗與 `dj now` 顯示原因，不會靜靜失敗。
+
 ### 需求
 
 - macOS 13 以上、Apple Silicon
 - Apple Music 訂閱，且**「同步資料庫」要開啟**（音樂 App → 設定 → 一般 → 同步資料庫）
-- 它只從你**已加入資料庫**的歌裡挑，不會去 Apple Music 目錄挖新歌
+- 排歌本身只用你**已加入資料庫**的歌；要它去目錄挖新歌，見下面的〈探索新曲目〉
+  （那個功能需要另外給「輔助使用」權限）
 
 ## 用法
 
@@ -44,8 +50,15 @@
 想聽聖誕鋼琴
 ```
 
-四顆按鈕：**👍** 之後多排這種／**👎** 封鎖這首並少排這類（同時跳過）／
-**＋** 存進「🎧 DJ 精選」／**⏭** 跳過。展開區有「接下來／剛剛播過」兩個分頁。
+六顆按鈕，左邊三顆是走帶控制、右邊三顆是回饋：
+
+**▶︎/⏸** 播放／暫停 —— 沒在播的時候按下去就是**從 app 啟動 DJ**（不必重打氛圍）／
+**⏹** 停止播放並關掉 DJ（必須同時關 DJ，否則下一次心跳會自己把音樂接回去）／
+**⏭** 跳過｜**👍** 之後多排這種／**👎** 封鎖這首並少排這類（同時跳過）／
+**＋** 存進「🎧 DJ 精選」。
+
+展開區有「接下來／剛剛播過」兩個分頁，以及探索的開關。佇列裡開頭是 ✨ 的，
+就是探索挖回來的新歌。
 
 ### 命令列（選用）
 
@@ -59,6 +72,10 @@ dj vibe "早晨咖啡"     # 換氛圍
 dj now                 # 現在播什麼＋接下來 10 首
 dj history             # 剛剛播過的歌
 dj up / down / keep / skip
+dj play / stop         # ▶︎/⏸ 切換播放、⏹ 停止並關 DJ
+dj explore             # ✨ 立刻探索一首新歌
+dj explore on|off      # 自動探索開關
+dj explore wide on|off # 探索是否也撈曲風排行榜
 ```
 
 ## 選曲怎麼決定
@@ -83,12 +100,67 @@ dj up / down / keep / skip
 最後是**加權隨機抽樣**（分數平方為權重，只從前段候選抽），所以同一個 vibe
 不會每次都給一模一樣的歌單。
 
+## 探索新曲目
+
+預設開著。DJ 在播、佇列要補歌、距上次探索超過 7 分鐘時，它會去挖一首**你資料庫裡沒有**
+的歌，加進資料庫，再排進佇列（佇列裡標成 ✨）。展開小窗可以關掉，或按 ✨ 立刻跑一次。
+
+候選來自兩條線：
+
+- **同藝人延伸**（預設）— 由當下 vibe 高分的藝人出發，用 iTunes Search API 的
+  `artistTerm` 找他們你還沒收的曲目。命中率最高、風格最穩。
+- **曲風排行榜**（「含排行榜」勾起來才開）— 用 vibe 命中的曲風去撈 Apple 的排行榜
+  RSS。這條才會冒出**沒聽過的藝人**，代價是命中率低一截。
+
+候選一律再走一次 `TrackPicker` 的評分（曲風權重、否定詞、速度標記、節慶曲、回饋權重），
+分數 ≤ 0 的不要 —— 探索不該把不合 vibe 的東西塞進你的資料庫。同一位藝人最多兩首，
+分數再加一點隨機擾動，否則 `artistTerm` 會讓同一個人整批洗版。
+
+不需要 API key，也不需要 Apple Developer 帳號。
+
+### 為什麼要「加進資料庫」這一步
+
+Apple Music 的目錄歌用 URL Scheme（`music://music.apple.com/…`）確實可以直接播，
+但那首歌對 AppleScript 而言是個幽靈：`class` 是 `URL track`、`cloud status` 是
+`missing value`、`container` 是 `Scripting`。它排不進播放清單，`duplicate` 會被
+`Can only duplicate subscription tracks to library source` 擋掉，👍👎 也綁不住 ID。
+
+只有真的加進資料庫，才拿得到可排隊的 track。而 Music.app 的 AppleScript 字典沒有
+「加入資料庫」這個動作，所以只能走無障礙 API 去點 UI。流程是：
+
+```
+iTunes Search API 找候選（免 key）
+  → open music://…            導覽到那首歌（不會中斷正在播的歌）
+  → 無障礙 API 捲動掃描找到那一列
+  → 點該列的「更多」→ 鍵盤選第一項「加入資料庫」
+  → 輪詢 findTrack() 等 iCloud 同步出真的 database ID
+  → 走既有的 append() 排進「🎧 DJ」清單
+```
+
+### 這條路的限制
+
+- **需要「輔助使用」權限**，而且它跟「自動化」是分開的兩格：送 Apple Event 給
+  System Events 算自動化，讀別的 app 的 UI 元素才算輔助使用。第一次探索會跳系統授權；
+  沒給就自動關掉探索不再空轉，並把原因寫進小窗與 `dj now`。
+- **自己重新 build 之後要重新授權**：ad-hoc 簽章的 cdhash 每次都不一樣，
+  輔助使用的授權跟著失效。裝 DMG 的一般使用者只會遇到一次。
+- **會真的把歌加進你的資料庫**，「最近加入」會留下痕跡。不想要就把探索關掉。
+- **綁在中文（或英文）按鈕描述上**：找的是描述為「更多」／`More` 的按鈕。
+  系統語言換成別的就會失效（會回報「點不到『更多』選單」，不會亂點）。
+- **那顆選單 Music.app 沒有暴露給無障礙 API**（`menu 1 of button` 取不到、
+  process 層也查不到 `menus`），只能用鍵盤選第一項。所以候選一定要先確認
+  **不在資料庫裡** —— 在的話第一項會變成「從資料庫中移除」。程式在送鍵之前就
+  用曲名＋藝人濾掉庫內曲，事後也會驗證資料庫真的長出這首歌，沒長出來就當失敗。
+- **單次探索約 20～25 秒**，所以跑在獨立佇列上，不擋 15 秒心跳。
+- 探索期間會短暫把 Music.app 帶到前景（鍵盤事件需要），做完立刻把焦點還給原本那個 app。
+
 ## 架構
 
 ```
 Apple Music DJ.app
 ├─ Engine        15 秒心跳：補佇列、吃回饋、記錄播放歷史
 ├─ TrackPicker   選曲評分（上面那六層）
+├─ Explorer      探索新曲目（iTunes Search API ＋ 無障礙 API 點「加入資料庫」）
 ├─ MusicBridge   AppleScript 橋接（osascript 子行程）
 └─ PanelView     SwiftUI 浮動小窗
         │
@@ -140,6 +212,16 @@ scripts/make-icon.py      # 重新產生圖示（需要 Pillow）
   `.nonactivatingPanel`，然後在輸入框取得焦點時 `NSApp.activate`、失焦與按完回饋鈕時
   `NSApp.deactivate` 把焦點還給原本在用的 app。
 - **launchd 背景程序不能住 `~/Documents`**（見 `legacy/python-daemon/`）。
+- **AppleScript 的 `item 2 of (position of e)` 會丟錯**，而錯誤被外層 `try` 吃掉之後
+  症狀是「明明找得到那個元素，取座標卻永遠失敗」。`position` 必須先落成變數再取 item。
+  同一類地雷還有保留字：`by`、`removed` 當變數名都會編譯失敗，訊息完全不知所云。
+- **Music.app 的曲目清單是虛擬化的**，只有畫面內的列會出現在無障礙樹裡，
+  深連結也不保證捲到目標那一列。要靠 `set value of scroll bar 1 of <scroll area>`
+  逐段掃描。順帶一提，把列舉範圍從整個視窗縮到內容區（跳過側邊欄），
+  單次探索從 95 秒降到 21 秒 —— `entire contents` 是這段唯一的效能瓶頸。
+- **古典樂誌面只印樂章名**：頁面上是「II. Adagio」，iTunes API 給的卻是
+  「Violin Concerto in E Major, BWV 1042: II. Adagio」。比對要放寬到樂章名，
+  再用同一列的時長字串把同名樂章區分開。
 
 ## 授權
 

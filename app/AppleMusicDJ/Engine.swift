@@ -15,6 +15,7 @@ struct QueueItem: Codable, Equatable {
     var id: String = ""
     var name: String = ""
     var artist: String = ""
+    var explored: Bool = false      // 由「探索新曲目」加進資料庫的
 }
 
 struct RecentItem: Codable, Equatable {
@@ -30,6 +31,14 @@ private struct PersistedState: Codable {
     var refillThreshold: Int = 8
     var feedbackOffset: Int = 0
     var feedback = Feedback()
+    // 探索新曲目
+    var exploreEnabled: Bool = true
+    var exploreWide: Bool = false        // 除了同藝人延伸，也撈曲風排行榜
+    var exploreCooldown: Double = 420    // 兩次探索之間至少隔這麼久（秒）
+    var lastExploreAt: Double = 0
+    var exploreSeen: [String] = []       // 試過的 "曲名|藝人"，不重複試
+    var exploredIDs: Set<String> = []    // 探索加進來的曲目 database ID
+    var lastExploreNote: String = ""     // 最後一次探索的結果，CLI 也讀得到
 }
 
 /// 心跳引擎：維持佇列深度、吃回饋、把狀態推給介面。
@@ -42,11 +51,19 @@ final class Engine: ObservableObject {
     @Published private(set) var recent: [RecentItem] = []
     @Published private(set) var artwork: NSImage?
     @Published private(set) var busy = false
+    @Published private(set) var exploring = false
+    @Published private(set) var exploreNote: String?
     // loading 期間要抑制 persist：否則 vibe 的 didSet 會在 enabled 還沒載入時
     // 就把 enabled:false 寫回檔案，害每次啟動 DJ 都被關掉。
     private var loading = false
     @Published var vibe = "" { didSet { if !loading, vibe != oldValue { persist() } } }
     @Published var enabled = false { didSet { if !loading, enabled != oldValue { persist() } } }
+    @Published var exploreEnabled = true {
+        didSet { if !loading, exploreEnabled != oldValue { st.exploreEnabled = exploreEnabled; persist() } }
+    }
+    @Published var exploreWide = false {
+        didSet { if !loading, exploreWide != oldValue { st.exploreWide = exploreWide; persist() } }
+    }
 
     private var st = PersistedState()
     private var library: [LibTrack] = []
@@ -56,6 +73,8 @@ final class Engine: ObservableObject {
     private var lastTrackID = ""
     private var timer: Timer?
     private let work = DispatchQueue(label: "dj.engine", qos: .utility)
+    // 探索要按 UI、等 iCloud 同步，動輒十幾秒；獨立佇列才不會卡住心跳
+    private let exploreQueue = DispatchQueue(label: "dj.explore", qos: .utility)
 
     // 檔案位置與 Python 版相同 → 既有的 `dj` CLI 仍然可用
     static let dir = FileManager.default.homeDirectoryForCurrentUser
@@ -90,6 +109,8 @@ final class Engine: ObservableObject {
         }
         vibe = st.vibe
         enabled = st.enabled
+        exploreEnabled = st.exploreEnabled
+        exploreWide = st.exploreWide
         history = (try? String(contentsOf: historyURL, encoding: .utf8))?
             .split(separator: "\n").suffix(400).compactMap {
                 try? JSONDecoder().decode(PlayedEntry.self, from: Data($0.utf8))
@@ -100,6 +121,8 @@ final class Engine: ObservableObject {
     private func persist() {
         st.vibe = vibe
         st.enabled = enabled
+        st.exploreEnabled = exploreEnabled
+        st.exploreWide = exploreWide
         guard let d = try? JSONEncoder().encode(st) else { return }
         try? d.write(to: stateURL, options: .atomic)
     }
@@ -174,10 +197,45 @@ final class Engine: ObservableObject {
     }
 
     func skip() { work.async { MusicBridge.nextTrack() } }
-    func togglePlayPause() {
+
+    var isPlaying: Bool { track?.state == "playing" }
+
+    /// ▶︎/⏸：在播就暫停；沒在播就把 DJ 打開並接上「🎧 DJ」清單。
+    /// 這是從 app 啟動 DJ 的入口 —— 以前只能靠輸入氛圍才會開始。
+    func playPause() {
+        if isPlaying {
+            work.async { [weak self] in
+                MusicBridge.pause()
+                Task { @MainActor in self?.refreshNowPlaying() }
+            }
+            return
+        }
+        if !vibe.isEmpty { enabled = true }
         work.async { [weak self] in
-            let playing = MusicBridge.playerState() == "playing"
-            playing ? MusicBridge.pause() : MusicBridge.resume()
+            let ps = MusicBridge.playerState()
+            if ps == "paused" {
+                MusicBridge.resume()
+            } else {
+                MusicBridge.ensurePlaylist(MusicBridge.djPlaylist)
+                if MusicBridge.playlistTrackIDs(MusicBridge.djPlaylist).isEmpty {
+                    MusicBridge.resume()        // 佇列還空著，下一次心跳會補歌並接管
+                } else {
+                    MusicBridge.playPlaylist(MusicBridge.djPlaylist)
+                }
+            }
+            Task { @MainActor in
+                self?.refreshNowPlaying()
+                self?.beat()
+            }
+        }
+    }
+
+    /// ⏹：停止播放並關掉 DJ。
+    /// 必須同時關 DJ —— 否則下一次心跳看到「沒在播」會自己把音樂接回去。
+    func stopAll() {
+        enabled = false
+        work.async { [weak self] in
+            MusicBridge.stop()
             Task { @MainActor in self?.refreshNowPlaying() }
         }
     }
@@ -223,6 +281,7 @@ final class Engine: ObservableObject {
         let snapshotVibe = vibe, snapshotEnabled = enabled
         let fb = st.feedback, hist = history
         let target = st.queueTarget, threshold = st.refillThreshold
+        let exploredSnapshot = st.exploredIDs
 
         let snapLib = library, snapPls = playlists
         work.async { [weak self] in
@@ -255,7 +314,9 @@ final class Engine: ObservableObject {
                 }
                 let byID = Dictionary(uniqueKeysWithValues: lib.map { ($0.id, $0) })
                 upcoming = (after + picks.map(\.id)).prefix(10).map {
-                    QueueItem(id: $0, name: byID[$0]?.name ?? "?", artist: byID[$0]?.artist ?? "")
+                    QueueItem(id: $0, name: byID[$0]?.name ?? "?",
+                              artist: byID[$0]?.artist ?? "",
+                              explored: exploredSnapshot.contains($0))
                 }
 
                 // 接管播放：沒在播、或播的東西已飄出 DJ 清單，都要拉回來
@@ -278,13 +339,108 @@ final class Engine: ObservableObject {
                 }
                 self.writeNowPlaying()
                 self.busy = false
+                self.maybeExplore()
             }
         }
     }
 
+    // MARK: 探索新曲目
+
+    /// 條件到齊才跑：DJ 開著、有 vibe、探索沒被關掉、冷卻過了、沒有正在跑。
+    /// 探索本身是背景工作，失敗不影響既有的排歌。
+    private func maybeExplore() {
+        guard exploreEnabled, enabled, !vibe.isEmpty, !exploring, !library.isEmpty else { return }
+        let now = Date().timeIntervalSince1970
+        guard now - st.lastExploreAt >= st.exploreCooldown else { return }
+        st.lastExploreAt = now
+        persist()
+        exploring = true
+
+        let lib = library, pls = playlists, snapVibe = vibe
+        let fb = st.feedback, wide = exploreWide
+        let seen = Set(st.exploreSeen)
+
+        exploreQueue.async { [weak self] in
+            guard Explorer.accessibilityGranted(prompt: true) else {
+                Task { @MainActor in
+                    guard let self else { return }
+                    self.exploring = false
+                    self.exploreEnabled = false
+                    let msg = "探索需要「輔助使用」權限：系統設定 → 隱私權與安全性 → "
+                            + "輔助使用 → 打開「Apple Music DJ」，然後重新開啟探索"
+                    self.st.lastExploreNote = msg
+                    self.persist()
+                    self.exploreNote = msg
+                }
+                return
+            }
+            let cands = Explorer.candidates(library: lib, playlists: pls, vibe: snapVibe,
+                                            feedback: fb, seen: seen, wide: wide)
+            var added: LibTrack?
+            var tried: [String] = []
+            var note = ""
+            var fatal = false
+
+            for c in cands.prefix(3) {
+                tried.append(c.key)
+                switch Explorer.add(c) {
+                case .success(let t):
+                    added = t
+                    note = "✨ 探索加入：\(t.name) — \(t.artist)"
+                case .failure(let e):
+                    note = "探索失敗：\(e.description)"
+                    if case .noAccessibility = e {
+                        fatal = true
+                        note = "探索需要「輔助使用」權限：系統設定 → 隱私權與安全性 → "
+                             + "輔助使用 → 打開「Apple Music DJ」，然後重新開啟探索"
+                    }
+                }
+                if added != nil || fatal { break }
+            }
+            if cands.isEmpty { note = "探索：這個氛圍暫時找不到新曲目" }
+
+            // 加成功就直接排進佇列，不必等下一輪整份資料庫重掃
+            if let t = added {
+                MusicBridge.ensurePlaylist(MusicBridge.djPlaylist)
+                MusicBridge.append([t.id], to: MusicBridge.djPlaylist)
+            }
+
+            Task { @MainActor in
+                guard let self else { return }
+                self.exploring = false
+                if let t = added, !self.library.contains(where: { $0.id == t.id }) {
+                    self.library.append(t)
+                    self.st.exploredIDs.insert(t.id)
+                }
+                self.st.exploreSeen.append(contentsOf: tried)
+                if self.st.exploreSeen.count > 800 {
+                    self.st.exploreSeen.removeFirst(self.st.exploreSeen.count - 800)
+                }
+                if fatal { self.exploreEnabled = false }   // 沒權限就別再空轉
+                self.persist()
+                self.st.lastExploreNote = note
+                self.exploreNote = note.isEmpty ? nil : note
+                if added != nil { self.beat() }
+            }
+        }
+    }
+
+    /// 手動觸發一次探索（介面的 ✨ 鈕、CLI 的 `dj explore now`）。
+    func exploreNow() {
+        guard !exploring else { return }
+        st.lastExploreAt = 0
+        if !enabled, !vibe.isEmpty { enabled = true }
+        maybeExplore()
+    }
+
+    func clearExploreNote() { exploreNote = nil }
+
     // MARK: 與 `dj` CLI 的相容層
 
-    private enum CLIAction { case up, down, keep, skip, vibe(String) }
+    private enum CLIAction {
+        case up, down, keep, skip, vibe(String)
+        case playpause, stop, explore, exploreOn(Bool), exploreWide(Bool)
+    }
 
     private func readCLIFeedback() -> [CLIAction] {
         guard let text = try? String(contentsOf: feedbackURL, encoding: .utf8) else { return [] }
@@ -301,6 +457,11 @@ final class Engine: ObservableObject {
             case "keep": acts.append(.keep)
             case "skip": acts.append(.skip)
             case "vibe": if let v = obj["vibe"] as? String { acts.append(.vibe(v)) }
+            case "playpause": acts.append(.playpause)
+            case "stop": acts.append(.stop)
+            case "explore": acts.append(.explore)
+            case "explore_on": acts.append(.exploreOn((obj["value"] as? Bool) ?? true))
+            case "explore_wide": acts.append(.exploreWide((obj["value"] as? Bool) ?? true))
             default: break
             }
         }
@@ -317,6 +478,11 @@ final class Engine: ObservableObject {
             case .keep: keep()
             case .skip: skip()
             case .vibe(let v): setVibe(v)
+            case .playpause: playPause()
+            case .stop: stopAll()
+            case .explore: exploreNow()
+            case .exploreOn(let v): exploreEnabled = v
+            case .exploreWide(let v): exploreWide = v
             }
         }
         persist()
@@ -325,6 +491,9 @@ final class Engine: ObservableObject {
     private func writeNowPlaying() {
         var payload: [String: Any] = [
             "vibe": vibe, "enabled": enabled,
+            "explore": exploreEnabled, "explore_wide": exploreWide,
+            "exploring": exploring,
+            "explore_note": st.lastExploreNote,
             "updated": Date().timeIntervalSince1970,
         ]
         if let t = track,

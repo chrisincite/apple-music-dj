@@ -206,7 +206,37 @@ enum MusicBridge {
         return false
     }
 
+    /// 用曲名＋藝人在資料庫裡找一首歌。探索加完歌之後靠它拿真正的 database ID
+    /// （剛加入的歌要等 iCloud 同步，呼叫端要輪詢）。
+    static func findTrack(name: String, artist: String) -> LibTrack? {
+        let n = name.replacingOccurrences(of: "\\", with: "\\\\")
+                    .replacingOccurrences(of: "\"", with: "\\\"")
+        let a = artist.replacingOccurrences(of: "\\", with: "\\\\")
+                      .replacingOccurrences(of: "\"", with: "\\\"")
+        let script = """
+        tell application "Music"
+          set AppleScript's text item delimiters to "\(sep)"
+          set L to library playlist 1
+          try
+            set t to (first track of L whose name is "\(n)" and artist is "\(a)")
+          on error
+            return ""
+          end try
+          return ((database ID of t) as text) & "\(sep)" & (name of t) & "\(sep)" & ¬
+                 (artist of t) & "\(sep)" & (album of t) & "\(sep)" & ¬
+                 (genre of t) & "\(sep)" & ((duration of t) as text)
+        end tell
+        """
+        guard let raw = run(script, timeout: 40), !raw.isEmpty else { return nil }
+        let p = raw.components(separatedBy: sep)
+        guard p.count >= 6 else { return nil }
+        return LibTrack(id: p[0].trimmed, name: p[1].trimmed, artist: p[2].trimmed,
+                        album: p[3].trimmed, genre: p[4].trimmed,
+                        duration: Double(p[5].trimmed) ?? 0)
+    }
+
     static func playPlaylist(_ name: String) { tell("play user playlist \"\(name)\"") }
+    static func stop() { tell("stop") }
     static func nextTrack() { tell("next track") }
     static func previousTrack() { tell("previous track") }
     static func pause() { tell("pause") }
