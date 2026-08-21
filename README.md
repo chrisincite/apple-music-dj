@@ -144,6 +144,17 @@ iTunes Search API 找候選（免 key）
   沒給就自動關掉探索不再空轉，並把原因寫進小窗與 `dj now`。
 - **自己重新 build 之後要重新授權**：ad-hoc 簽章的 cdhash 每次都不一樣，
   輔助使用的授權跟著失效。裝 DMG 的一般使用者只會遇到一次。
+  麻煩的是**在系統設定裡「把勾關掉再打開」修不好** —— TCC 那筆記錄的 code requirement
+  綁死當初的 cdhash，切換開關只改批准狀態、不會重新綁定，於是清單看起來是開的、
+  `AXIsProcessTrusted` 卻永遠回 false。要整筆刪掉讓它重建：
+
+  ```bash
+  tccutil reset Accessibility net.housearch.applemusicdj   # 不需要 sudo
+  ```
+
+  然後**重新開啟 app**（授權在程序啟動時就定案，不重開讀到的還是舊快取）。
+  開發時也記得同一時間只留一份 app 在跑：`build/` 與 `~/Applications/` 兩份的
+  cdhash 不一樣，授權不共用。
 - **會真的把歌加進你的資料庫**，「最近加入」會留下痕跡。不想要就把探索關掉。
 - **綁在中文（或英文）按鈕描述上**：找的是描述為「更多」／`More` 的按鈕。
   系統語言換成別的就會失效（會回報「點不到『更多』選單」，不會亂點）。
