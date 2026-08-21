@@ -165,7 +165,7 @@ enum TrackPicker {
     /// 加權隨機抽 n 首：高分優先但保留意外性，同一藝人最多 2 首、同名同藝人去重。
     static func pick(library: [LibTrack], playlists: [String: [String]], vibe: String,
                      feedback: Feedback, history: [PlayedEntry], count n: Int,
-                     exclude: Set<String> = []) -> [LibTrack] {
+                     exclude: Set<String> = [], noRepeatDays: Double = 4) -> [LibTrack] {
         guard n > 0, !library.isEmpty else { return [] }
         let now = Date().timeIntervalSince1970
         let gw = genreWeights(vibe)
@@ -217,8 +217,12 @@ enum TrackPicker {
             s += feedback.albumWeight[t.album] ?? 0
             s += feedback.genreWeight[g] ?? 0
 
-            // 近期播過的降權，6 小時衰減完
-            if let at = recent[t.id] { s -= 6.0 * exp(-(now - at) / 21600) }
+            // 近期播過的：N 天內直接不選，之後才回到衰減降權。
+            // 原本只有 6 小時衰減，跨天等於沒有保護，同幾首會一直回來。
+            if let at = recent[t.id] {
+                if now - at < noRepeatDays * 86400 { continue }
+                s -= 6.0 * exp(-(now - at) / 21600)
+            }
 
             scored.append((s, t))
         }

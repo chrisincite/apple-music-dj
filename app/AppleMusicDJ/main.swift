@@ -194,11 +194,11 @@ struct PanelView: View {
             HStack(spacing: 6) {
                 Toggle("探索新曲目", isOn: $e.exploreEnabled)
                     .toggleStyle(.checkbox).font(.system(size: 11))
-                    .help("定期從 Apple Music 目錄找一首資料庫裡沒有的歌，加進資料庫後排進佇列")
-                Toggle("含排行榜", isOn: $e.exploreWide)
+                    .help("每補 10 首歌，其中 1 首從 Apple Music 目錄挖你資料庫裡沒有的歌")
+                Toggle("含相似藝人", isOn: $e.exploreWide)
                     .toggleStyle(.checkbox).font(.system(size: 11))
                     .disabled(!e.exploreEnabled)
-                    .help("除了延伸你已經在聽的藝人，也撈曲風排行榜（會冒出沒聽過的藝人，命中率較低）")
+                    .help("除了延伸你已經在聽的藝人，也找 Apple 算出的相似藝人（會冒出沒聽過的人）")
                 Spacer(minLength: 4)
                 Button {
                     e.exploreNow(); ui.showFlash("✨ 開始探索…"); returnFocus()

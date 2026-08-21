@@ -175,6 +175,32 @@ enum MusicBridge {
         """, timeout: 300)
     }
 
+    /// 刪掉清單裡「正在播的那首之前」的所有曲目，但保留緊鄰的前一首。
+    ///
+    /// 這是消耗式佇列的核心：播過就從清單消失，於是清單第一首永遠是「下一首沒播的」，
+    /// 關掉 app 再開就自然從那裡接下去，不必記任何播放位置。
+    /// 留一首是為了讓 👍👎＋ 還來得及對剛播完的那首生效，⏮ 也還退得回去一步。
+    ///
+    /// 實測：刪掉已播過的曲目不會中斷播放，播放順序也不會脫節。
+    /// 回傳刪掉幾首。
+    @discardableResult
+    static func trimBeforeCurrent(_ name: String, currentID: String, keepBack: Int = 1) -> Int {
+        guard !currentID.isEmpty else { return 0 }
+        let ids = playlistTrackIDs(name)
+        guard let idx = ids.firstIndex(of: currentID) else { return 0 }
+        let removable = idx - keepBack
+        guard removable > 0 else { return 0 }
+        run("""
+        tell application "Music"
+          set p to user playlist "\(name)"
+          repeat \(removable) times
+            delete first track of p
+          end repeat
+        end tell
+        """, timeout: 120)
+        return removable
+    }
+
     static func clearPlaylist(_ name: String) {
         run("""
         tell application "Music"

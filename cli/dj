@@ -50,7 +50,7 @@ USAGE = """用法：
   dj stop           ⏹ 停止播放並關掉 DJ
   dj explore        ✨ 立刻探索一首資料庫裡沒有的新歌
   dj explore on|off 開關自動探索
-  dj explore wide on|off  探索是否也撈曲風排行榜
+  dj explore wide on|off  探索是否也找相似藝人
   dj panel          開啟／叫回浮動小窗"""
 
 
@@ -81,7 +81,7 @@ def main():
                   f" / {dur // 60}:{dur % 60:02d}  [{t['state']}]")
         exp = "探索中…" if d.get("exploring") else ("開" if d.get("explore") else "關")
         if d.get("explore") and d.get("explore_wide"):
-            exp += "＋排行榜"
+            exp += "＋相似藝人"
         print(f"🎚 vibe：{d.get('vibe') or '（未設定）'}   "
               f"DJ：{'開' if d.get('enabled') else '關'}   ✨ 探索：{exp}")
         note = d.get("explore_note")
@@ -128,7 +128,7 @@ def main():
         elif sub == "wide":
             on = val != "off"
             send("explore_wide", value=on)
-            print(f"✨ 探索含排行榜：{'開' if on else '關'}")
+            print(f"✨ 探索含相似藝人：{'開' if on else '關'}")
         else:
             print(USAGE)
     elif cmd == "panel":

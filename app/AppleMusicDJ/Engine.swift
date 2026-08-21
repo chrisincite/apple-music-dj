@@ -27,18 +27,55 @@ struct RecentItem: Codable, Equatable {
 private struct PersistedState: Codable {
     var vibe: String = ""
     var enabled: Bool = false
-    var queueTarget: Int = 12
-    var refillThreshold: Int = 8
+    var queueTarget: Int = 10
+    var refillThreshold: Int = 10        // 消耗式佇列：少一首就補一首
+    /// 每 N 首補位裡有一首走探索（其餘從資料庫挑）
+    var exploreEvery: Int = 10
+    var refillsSinceExplore: Int = 0
+    /// 幾天內播過的不再選。原本只有 6 小時衰減，跨天完全失效。
+    var noRepeatDays: Double = 4
     var feedbackOffset: Int = 0
     var feedback = Feedback()
     // 探索新曲目
     var exploreEnabled: Bool = true
     var exploreWide: Bool = false        // 除了同藝人延伸，也撈曲風排行榜
-    var exploreCooldown: Double = 420    // 兩次探索之間至少隔這麼久（秒）
+    var exploreCooldown: Double = 90     // 兩次探索之間的下限（真正的節流是 exploreEvery）
     var lastExploreAt: Double = 0
     var exploreSeen: [String] = []       // 試過的 "曲名|藝人"，不重複試
     var exploredIDs: Set<String> = []    // 探索加進來的曲目 database ID
     var lastExploreNote: String = ""     // 最後一次探索的結果，CLI 也讀得到
+
+    init() {}
+
+    /// 手寫解碼，每個欄位都是「有就用、沒有就用預設」。
+    ///
+    /// Swift 合成的 `Decodable` **不會**拿屬性預設值當缺鍵的 fallback —— 少一個 key
+    /// 就整份 throw。配上呼叫端的 `try?`，症狀是升級後整份狀態靜靜變回預設值：
+    /// 氛圍不見、回饋權重歸零，而且 `feedbackOffset` 一起歸零會讓 app 把
+    /// `feedback.jsonl` 裡的**整段歷史指令重播一遍**（舊的換氛圍、舊的開關全部重來一次）。
+    /// 每次替這個 struct 加欄位都會觸發，所以解碼一定要手寫。
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        func s<T: Decodable>(_ k: CodingKeys, _ fallback: T) -> T {
+            (try? c.decodeIfPresent(T.self, forKey: k)) .flatMap { $0 } ?? fallback
+        }
+        vibe = s(.vibe, "")
+        enabled = s(.enabled, false)
+        queueTarget = s(.queueTarget, 10)
+        refillThreshold = s(.refillThreshold, 10)
+        exploreEvery = s(.exploreEvery, 10)
+        refillsSinceExplore = s(.refillsSinceExplore, 0)
+        noRepeatDays = s(.noRepeatDays, 4)
+        feedbackOffset = s(.feedbackOffset, 0)
+        feedback = s(.feedback, Feedback())
+        exploreEnabled = s(.exploreEnabled, true)
+        exploreWide = s(.exploreWide, false)
+        exploreCooldown = s(.exploreCooldown, 90)
+        lastExploreAt = s(.lastExploreAt, 0)
+        exploreSeen = s(.exploreSeen, [])
+        exploredIDs = s(.exploredIDs, [])
+        lastExploreNote = s(.lastExploreNote, "")
+    }
 }
 
 /// 心跳引擎：維持佇列深度、吃回饋、把狀態推給介面。
@@ -162,8 +199,15 @@ final class Engine: ObservableObject {
         work.async { [weak self] in
             let np = MusicBridge.nowPlaying()
             MusicBridge.ensurePlaylist(MusicBridge.djPlaylist)
-            // 保住正在播的那首，只清掉它後面的舊 vibe 佇列
-            MusicBridge.trimAfterCurrent(MusicBridge.djPlaylist, keepID: np?.id ?? "")
+            // 換氛圍＝整份重來：保住正在播的那首（不然會當場斷音），前後全清，
+            // 下一輪心跳會照新氛圍補滿
+            let cur = np?.id ?? ""
+            MusicBridge.trimAfterCurrent(MusicBridge.djPlaylist, keepID: cur)
+            if !cur.isEmpty {
+                MusicBridge.trimBeforeCurrent(MusicBridge.djPlaylist, currentID: cur, keepBack: 0)
+            } else {
+                MusicBridge.clearPlaylist(MusicBridge.djPlaylist)
+            }
             Task { @MainActor in self?.beat() }
         }
     }
@@ -282,6 +326,7 @@ final class Engine: ObservableObject {
         let fb = st.feedback, hist = history
         let target = st.queueTarget, threshold = st.refillThreshold
         let exploredSnapshot = st.exploredIDs
+        let noRepeatDays = st.noRepeatDays
 
         let snapLib = library, snapPls = playlists
         work.async { [weak self] in
@@ -293,10 +338,16 @@ final class Engine: ObservableObject {
             }
             let np = MusicBridge.nowPlaying()
             var upcoming: [QueueItem] = []
+            var refilled = 0
             if snapshotEnabled && !snapshotVibe.isEmpty {
                 MusicBridge.ensurePlaylist(MusicBridge.djPlaylist)
-                var ids = MusicBridge.playlistTrackIDs(MusicBridge.djPlaylist)
                 let cur = np?.id ?? ""
+                // 消耗式佇列：播過的（保留緊鄰前一首）從清單移除，
+                // 於是清單第一首永遠是「下一首沒播的」——關掉再開就從那裡接下去
+                if !cur.isEmpty {
+                    MusicBridge.trimBeforeCurrent(MusicBridge.djPlaylist, currentID: cur)
+                }
+                var ids = MusicBridge.playlistTrackIDs(MusicBridge.djPlaylist)
                 let idx = ids.firstIndex(of: cur) ?? -1
                 let after = Array(ids[(idx + 1)...])
                 let remaining = after.count
@@ -306,12 +357,14 @@ final class Engine: ObservableObject {
                     picks = TrackPicker.pick(library: lib, playlists: pls, vibe: snapshotVibe,
                                         feedback: fb, history: hist,
                                         count: target - remaining,
-                                        exclude: Set(after))
+                                        exclude: Set(after),
+                                        noRepeatDays: noRepeatDays)
                     if !picks.isEmpty {
                         MusicBridge.append(picks.map(\.id), to: MusicBridge.djPlaylist)
                         ids = MusicBridge.playlistTrackIDs(MusicBridge.djPlaylist)
                     }
                 }
+                refilled = picks.count
                 let byID = Dictionary(uniqueKeysWithValues: lib.map { ($0.id, $0) })
                 upcoming = (after + picks.map(\.id)).prefix(10).map {
                     QueueItem(id: $0, name: byID[$0]?.name ?? "?",
@@ -331,6 +384,7 @@ final class Engine: ObservableObject {
             Task { @MainActor in
                 self.library = lib
                 self.playlists = pls
+                if refilled > 0 { self.st.refillsSinceExplore += refilled }
                 if needLibrary && !lib.isEmpty { self.libraryStamp = Date() }
                 if finalNP?.id != self.track?.id { self.onTrackChanged(finalNP) }
                 self.track = finalNP
@@ -346,13 +400,21 @@ final class Engine: ObservableObject {
 
     // MARK: 探索新曲目
 
-    /// 條件到齊才跑：DJ 開著、有 vibe、探索沒被關掉、冷卻過了、沒有正在跑。
-    /// 探索本身是背景工作，失敗不影響既有的排歌。
-    private func maybeExplore() {
+    /// 條件到齊才跑：DJ 開著、有 vibe、探索沒被關掉、沒有正在跑，
+    /// 而且**已經補了 exploreEvery 首**——探索是配額制的（預設 10 首補 1 首）。
+    ///
+    /// 為什麼要配額：每首歌約 4 分鐘，若每次補位都探索，等於每小時往資料庫塞 15 首。
+    /// 那不只讓資料庫變肥，還會稀釋掉「拿 vibe 比對你自己的播放清單名稱」這個
+    /// 最強的選曲訊號 —— 探索來的歌不在任何清單裡。
+    private func maybeExplore(force: Bool = false) {
         guard exploreEnabled, enabled, !vibe.isEmpty, !exploring, !library.isEmpty else { return }
+        if !force {
+            guard st.refillsSinceExplore >= st.exploreEvery else { return }
+        }
         let now = Date().timeIntervalSince1970
-        guard now - st.lastExploreAt >= st.exploreCooldown else { return }
+        guard force || now - st.lastExploreAt >= st.exploreCooldown else { return }
         st.lastExploreAt = now
+        st.refillsSinceExplore = 0
         persist()
         exploring = true
 
@@ -361,13 +423,14 @@ final class Engine: ObservableObject {
         let seen = Set(st.exploreSeen)
 
         exploreQueue.async { [weak self] in
-            guard Explorer.accessibilityGranted(prompt: true) else {
+            guard AppleMusicAPI.sessionOK() else {
                 Task { @MainActor in
                     guard let self else { return }
                     self.exploring = false
                     self.exploreEnabled = false
-                    let msg = "探索需要「輔助使用」權限：系統設定 → 隱私權與安全性 → "
-                            + "輔助使用 → 打開「Apple Music DJ」，然後重新開啟探索"
+                    let msg = AppleMusicAPI.hasUserToken
+                        ? "Apple Music token 失效了，重新取得一次再打開探索（見 README）"
+                        : "探索要先設定 Apple Music token，見 README「探索新曲目」一節"
                     self.st.lastExploreNote = msg
                     self.persist()
                     self.exploreNote = msg
@@ -389,10 +452,12 @@ final class Engine: ObservableObject {
                     note = "✨ 探索加入：\(t.name) — \(t.artist)"
                 case .failure(let e):
                     note = "探索失敗：\(e.description)"
-                    if case .noAccessibility = e {
-                        fatal = true
-                        note = "探索需要「輔助使用」權限：系統設定 → 隱私權與安全性 → "
-                             + "輔助使用 → 打開「Apple Music DJ」，然後重新開啟探索"
+                    // 憑證問題再試幾首也一樣，直接停下來講清楚
+                    if case .api(let apiErr) = e {
+                        switch apiErr {
+                        case .noUserToken, .unauthorized: fatal = true
+                        case .failed: break
+                        }
                     }
                 }
                 if added != nil || fatal { break }
@@ -417,8 +482,8 @@ final class Engine: ObservableObject {
                     self.st.exploreSeen.removeFirst(self.st.exploreSeen.count - 800)
                 }
                 if fatal { self.exploreEnabled = false }   // 沒權限就別再空轉
-                self.persist()
                 self.st.lastExploreNote = note
+                self.persist()
                 self.exploreNote = note.isEmpty ? nil : note
                 if added != nil { self.beat() }
             }
@@ -428,9 +493,8 @@ final class Engine: ObservableObject {
     /// 手動觸發一次探索（介面的 ✨ 鈕、CLI 的 `dj explore now`）。
     func exploreNow() {
         guard !exploring else { return }
-        st.lastExploreAt = 0
         if !enabled, !vibe.isEmpty { enabled = true }
-        maybeExplore()
+        maybeExplore(force: true)
     }
 
     func clearExploreNote() { exploreNote = nil }
