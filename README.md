@@ -121,6 +121,18 @@ scripts/make-icon.py      # 重新產生圖示（需要 Pillow）
   且 `NSApplication.delegate` 是 weak，delegate 必須有人持有否則被回收。
 - **`Picker` 會跟 SwiftUI 的 `Picker` 撞名**，錯誤訊息卻指向不相干的
   `.pickerStyle(.segmented)`。
+- **浮動面板裡的文字輸入是三個問題疊在一起**，症狀是「點輸入框，整個 app 就消失」：
+  1. `NSPanel` 的 `.utilityWindow` 預設 `hidesOnDeactivate = true`，app 一失去作用中
+     狀態面板就自己隱藏；再配上 `applicationShouldTerminateAfterLastWindowClosed`
+     回傳 `true`，等於**焦點一離開就自動退出**。而且離開碼是 0，不會留下當機報告，
+     看起來就像憑空消失。
+  2. `.nonactivatingPanel` 讓點擊不會使 app 變成作用中，鍵盤事件根本不會送到輸入框。
+  3. `.accessory` 策略的 app 不作用中就沒有 text input context，中文輸入法接不上，
+     console 會噴 `error messaging the mach port for IMKCFRunLoopWakeUpReliable`。
+
+  解法是三個一起改：`hidesOnDeactivate = false`、終止判斷改回 `false`、拿掉
+  `.nonactivatingPanel`，然後在輸入框取得焦點時 `NSApp.activate`、失焦與按完回饋鈕時
+  `NSApp.deactivate` 把焦點還給原本在用的 app。
 - **launchd 背景程序不能住 `~/Documents`**（見 `legacy/python-daemon/`）。
 
 ## 授權

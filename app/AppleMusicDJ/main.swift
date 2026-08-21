@@ -43,6 +43,7 @@ struct FeedbackButton: View {
 struct PanelView: View {
     @ObservedObject var e: Engine
     @ObservedObject var ui: UIState
+    @FocusState private var vibeFocused: Bool
 
     private var t: Track? { e.track }
 
@@ -84,6 +85,7 @@ struct PanelView: View {
             VStack(spacing: 6) {
                 iconButton("xmark", 9) { NSApp.terminate(nil) }
                 iconButton(ui.expanded ? "chevron.up" : "chevron.down", 9) {
+                    if ui.expanded { vibeFocused = false }
                     withAnimation(.easeOut(duration: 0.16)) { ui.expanded.toggle() }
                 }
             }
@@ -94,16 +96,16 @@ struct PanelView: View {
     private var controls: some View {
         HStack(spacing: 7) {
             FeedbackButton(symbol: "hand.thumbsup", help: "更多這種") {
-                e.thumbsUp(); ui.showFlash("👍 之後多排這種")
+                e.thumbsUp(); ui.showFlash("👍 之後多排這種"); returnFocus()
             }
             FeedbackButton(symbol: "hand.thumbsdown", help: "不要這首，並少排這類") {
-                e.thumbsDown(); ui.showFlash("👎 已封鎖並跳過")
+                e.thumbsDown(); ui.showFlash("👎 已封鎖並跳過"); returnFocus()
             }
             FeedbackButton(symbol: "plus", help: "存進「🎧 DJ 精選」") {
-                e.keep(); ui.showFlash("＋ 已存入精選")
+                e.keep(); ui.showFlash("＋ 已存入精選"); returnFocus()
             }
             FeedbackButton(symbol: "forward.end", help: "跳過") {
-                e.skip(); ui.showFlash("⏭ 跳過")
+                e.skip(); ui.showFlash("⏭ 跳過"); returnFocus()
             }
             Spacer()
             Circle().fill(e.enabled ? Color.green : Color.secondary.opacity(0.4))
@@ -146,10 +148,16 @@ struct PanelView: View {
                     .font(.system(size: 10)).foregroundStyle(.secondary)
                 TextField("換個氛圍…例如「深夜寫程式」", text: $ui.vibeDraft)
                     .textFieldStyle(.plain).font(.system(size: 11))
-                    .onSubmit {
-                        let v = ui.vibeDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-                        guard !v.isEmpty else { return }
-                        e.setVibe(v); ui.vibeDraft = ""; ui.showFlash("氛圍已更新：\(v)")
+                    .focused($vibeFocused)
+                    .onSubmit { submitVibe() }
+                    // 這個面板平常刻意不搶焦點（按 👍 不會打斷你手上的工作），
+                    // 但不搶焦點的 app 建立不了 text input context，中文輸入法會直接壞掉。
+                    // 所以只在輸入框真的拿到焦點時才啟用 app，離開就還回去。
+                    .onChange(of: vibeFocused) { focused in
+                        // accessory app 不會因為點擊自動變成作用中，
+                        // 不作用中就沒有 text input context，輸入法接不上。
+                        if focused { NSApp.activate(ignoringOtherApps: true) }
+                        else { NSApp.deactivate() }
                     }
             }
             .padding(.horizontal, 9).padding(.vertical, 6)
@@ -179,6 +187,21 @@ struct PanelView: View {
             .frame(maxHeight: 150)
         }
         .padding(.horizontal, 13).padding(.bottom, 12)
+    }
+
+    /// 按回饋鈕不該打斷手上的工作：做完就把作用中狀態還給原本那個 app。
+    private func returnFocus() {
+        guard !vibeFocused else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { NSApp.deactivate() }
+    }
+
+    private func submitVibe() {
+        let v = ui.vibeDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        vibeFocused = false
+        guard !v.isEmpty else { return }
+        e.setVibe(v)
+        ui.vibeDraft = ""
+        ui.showFlash("氛圍已更新：\(v)")
     }
 
     private func row(index: String, name: String, artist: String,
@@ -256,14 +279,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         host.sizingOptions = [.intrinsicContentSize]
         host.frame = NSRect(x: 0, y: 0, width: 330, height: 108)
 
+        // 不能用 .nonactivatingPanel：那樣點擊不會讓 app 變成作用中，
+        // 鍵盤事件與輸入法都到不了輸入框。改用一般面板 + 按鈕按完主動還焦點。
         panel = FloatingPanel(contentRect: host.frame,
-                              styleMask: [.borderless, .nonactivatingPanel, .utilityWindow],
+                              styleMask: [.borderless, .utilityWindow],
                               backing: .buffered, defer: false)
         panel.contentView = host
         panel.isFloatingPanel = true
         panel.level = .floating
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.isMovableByWindowBackground = true
+        // NSPanel 的 .utilityWindow 預設 hidesOnDeactivate = true：app 一失去
+        // 作用中狀態面板就自己隱藏，配上「最後一個視窗關閉就結束」等於自動退出。
+        panel.hidesOnDeactivate = false
         panel.backgroundColor = .clear
         panel.isOpaque = false
         panel.hasShadow = true
@@ -278,7 +306,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if engine.vibe.isEmpty { ui.expanded = true }
     }
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ s: NSApplication) -> Bool { true }
+    // 只有面板上的 ✕ 才結束 app；視窗被隱藏不該等於離開。
+    func applicationShouldTerminateAfterLastWindowClosed(_ s: NSApplication) -> Bool { false }
 }
 
 @main
